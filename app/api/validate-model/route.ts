@@ -12,8 +12,17 @@ import { createOllama } from "ollama-ai-provider-v2"
 export const runtime = "nodejs"
 
 /**
+ * Check if private URLs are allowed via environment variable.
+ * Set ALLOW_PRIVATE_URLS=true for self-hosted deployments that need local network access.
+ */
+function allowPrivateUrls(): boolean {
+    return process.env.ALLOW_PRIVATE_URLS === "true"
+}
+
+/**
  * SECURITY: Check if URL points to private/internal network (SSRF protection)
  * Blocks: localhost, private IPs, link-local, AWS metadata service
+ * Can be bypassed with ALLOW_PRIVATE_URLS=true for self-hosted deployments.
  */
 function isPrivateUrl(urlString: string): boolean {
     try {
@@ -103,9 +112,13 @@ export async function POST(req: Request) {
         }
 
         // SECURITY: Block SSRF attacks via custom baseUrl
-        if (baseUrl && isPrivateUrl(baseUrl)) {
+        // Can be bypassed with ALLOW_PRIVATE_URLS=true for self-hosted deployments
+        if (baseUrl && !allowPrivateUrls() && isPrivateUrl(baseUrl)) {
             return NextResponse.json(
-                { valid: false, error: "Invalid base URL" },
+                {
+                    valid: false,
+                    error: "Invalid base URL (private URLs blocked). Set ALLOW_PRIVATE_URLS=true to allow.",
+                },
                 { status: 400 },
             )
         }
