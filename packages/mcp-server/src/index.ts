@@ -39,6 +39,7 @@ import {
     getState,
     requestSync,
     setState,
+    shutdown,
     startHttpServer,
     waitForSync,
 } from "./http-server.js"
@@ -47,7 +48,7 @@ import { validateAndFixXml } from "./xml-validation.js"
 
 // Server configuration
 const config = {
-    port: parseInt(process.env.PORT || "6002"),
+    port: parseInt(process.env.PORT || "6002", 10),
 }
 
 // Session state (single session for simplicity)
@@ -617,6 +618,31 @@ server.registerTool(
         }
     },
 )
+
+// Graceful shutdown handler
+let isShuttingDown = false
+function gracefulShutdown(reason: string) {
+    if (isShuttingDown) return
+    isShuttingDown = true
+    log.info(`Shutting down: ${reason}`)
+    shutdown()
+    process.exit(0)
+}
+
+// Handle stdin close (primary method - works on all platforms including Windows)
+process.stdin.on("close", () => gracefulShutdown("stdin closed"))
+process.stdin.on("end", () => gracefulShutdown("stdin ended"))
+
+// Handle signals (may not work reliably on Windows)
+process.on("SIGINT", () => gracefulShutdown("SIGINT"))
+process.on("SIGTERM", () => gracefulShutdown("SIGTERM"))
+
+// Handle broken pipe (writing to closed stdout)
+process.stdout.on("error", (err) => {
+    if (err.code === "EPIPE" || err.code === "ERR_STREAM_DESTROYED") {
+        gracefulShutdown("stdout error")
+    }
+})
 
 // Start the MCP server
 async function main() {

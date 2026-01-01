@@ -27,6 +27,7 @@ import {
     ReasoningTrigger,
 } from "@/components/ai-elements/reasoning"
 import { ScrollArea } from "@/components/ui/scroll-area"
+import { useDictionary } from "@/hooks/use-dictionary"
 import { getApiEndpoint } from "@/lib/base-path"
 import {
     applyDiagramOperations,
@@ -192,6 +193,7 @@ interface ChatMessageDisplayProps {
     onRegenerate?: (messageIndex: number) => void
     onEditMessage?: (messageIndex: number, newText: string) => void
     status?: "streaming" | "submitted" | "idle" | "error" | "ready"
+    isRestored?: boolean
 }
 
 export function ChatMessageDisplay({
@@ -204,7 +206,9 @@ export function ChatMessageDisplay({
     onRegenerate,
     onEditMessage,
     status = "idle",
+    isRestored = false,
 }: ChatMessageDisplayProps) {
+    const dict = useDictionary()
     const { chartXML, loadDiagram: onDisplayChart } = useDiagram()
     const messagesEndRef = useRef<HTMLDivElement>(null)
     const previousXML = useRef<string>("")
@@ -228,6 +232,12 @@ export function ChatMessageDisplay({
     const [expandedTools, setExpandedTools] = useState<Record<string, boolean>>(
         {},
     )
+    const [copiedToolCallId, setCopiedToolCallId] = useState<string | null>(
+        null,
+    )
+    const [copyFailedToolCallId, setCopyFailedToolCallId] = useState<
+        string | null
+    >(null)
     const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null)
     const [copyFailedMessageId, setCopyFailedMessageId] = useState<
         string | null
@@ -242,14 +252,49 @@ export function ChatMessageDisplay({
     const [expandedPdfSections, setExpandedPdfSections] = useState<
         Record<string, boolean>
     >({})
+    // Track message IDs that were restored from localStorage (skip animation for these)
+    const restoredMessageIdsRef = useRef<Set<string> | null>(null)
 
-    const copyMessageToClipboard = async (messageId: string, text: string) => {
+    // Capture restored message IDs once when isRestored becomes true
+    useEffect(() => {
+        if (isRestored && restoredMessageIdsRef.current === null) {
+            restoredMessageIdsRef.current = new Set(messages.map((m) => m.id))
+        }
+    }, [isRestored, messages])
+
+    const setCopyState = (
+        messageId: string,
+        isToolCall: boolean,
+        isSuccess: boolean,
+    ) => {
+        if (isSuccess) {
+            if (isToolCall) {
+                setCopiedToolCallId(messageId)
+                setTimeout(() => setCopiedToolCallId(null), 2000)
+            } else {
+                setCopiedMessageId(messageId)
+                setTimeout(() => setCopiedMessageId(null), 2000)
+            }
+        } else {
+            if (isToolCall) {
+                setCopyFailedToolCallId(messageId)
+                setTimeout(() => setCopyFailedToolCallId(null), 2000)
+            } else {
+                setCopyFailedMessageId(messageId)
+                setTimeout(() => setCopyFailedMessageId(null), 2000)
+            }
+        }
+    }
+
+    const copyMessageToClipboard = async (
+        messageId: string,
+        text: string,
+        isToolCall = false,
+    ) => {
         try {
             await navigator.clipboard.writeText(text)
-
-            setCopiedMessageId(messageId)
-            setTimeout(() => setCopiedMessageId(null), 2000)
-        } catch (err) {
+            setCopyState(messageId, isToolCall, true)
+        } catch (_err) {
             // Fallback for non-secure contexts (HTTP) or permission denied
             const textarea = document.createElement("textarea")
             textarea.value = text
@@ -264,15 +309,11 @@ export function ChatMessageDisplay({
                 if (!success) {
                     throw new Error("Copy command failed")
                 }
-                setCopiedMessageId(messageId)
-                setTimeout(() => setCopiedMessageId(null), 2000)
+                setCopyState(messageId, isToolCall, true)
             } catch (fallbackErr) {
                 console.error("Failed to copy message:", fallbackErr)
-                toast.error(
-                    "Failed to copy message. Please copy manually or check clipboard permissions.",
-                )
-                setCopyFailedMessageId(messageId)
-                setTimeout(() => setCopyFailedMessageId(null), 2000)
+                toast.error(dict.chat.failedToCopyDetail)
+                setCopyState(messageId, isToolCall, false)
             } finally {
                 document.body.removeChild(textarea)
             }
@@ -304,7 +345,7 @@ export function ChatMessageDisplay({
             })
         } catch (error) {
             console.error("Failed to log feedback:", error)
-            toast.error("Failed to record your feedback. Please try again.")
+            toast.error(dict.errors.failedToRecordFeedback)
             // Revert optimistic UI update
             setFeedback((prev) => {
                 const next = { ...prev }
@@ -349,9 +390,7 @@ export function ChatMessageDisplay({
                         console.error(
                             "[ChatMessageDisplay] Malformed XML detected in final output",
                         )
-                        toast.error(
-                            "AI generated invalid diagram XML. Please try regenerating.",
-                        )
+                        toast.error(dict.errors.malformedXml)
                     }
                     return // Skip this update
                 }
@@ -402,9 +441,7 @@ export function ChatMessageDisplay({
                             "[ChatMessageDisplay] XML validation failed:",
                             validation.error,
                         )
-                        toast.error(
-                            "Diagram validation failed. Please try regenerating.",
-                        )
+                        toast.error(dict.errors.validationFailed)
                     }
                 } catch (error) {
                     console.error(
@@ -413,9 +450,7 @@ export function ChatMessageDisplay({
                     )
                     // Only show toast if this is the final XML (not during streaming)
                     if (showToast) {
-                        toast.error(
-                            "Failed to process diagram. Please try regenerating.",
-                        )
+                        toast.error(dict.errors.failedToProcess)
                     }
                 }
             }
@@ -645,8 +680,10 @@ export function ChatMessageDisplay({
     const renderToolPart = (part: ToolPartLike) => {
         const callId = part.toolCallId
         const { state, input, output } = part
-        const isExpanded = expandedTools[callId] ?? true
+        // Default to collapsed if tool is complete, expanded if still streaming
+        const isExpanded = expandedTools[callId] ?? state !== "output-available"
         const toolName = part.type?.replace("tool-", "")
+        const isCopied = copiedToolCallId === callId
 
         const toggleExpanded = () => {
             setExpandedTools((prev) => ({
@@ -665,6 +702,35 @@ export function ChatMessageDisplay({
                     return "Get Shape Library"
                 default:
                     return name
+            }
+        }
+
+        const handleCopy = () => {
+            let textToCopy = ""
+
+            if (input && typeof input === "object") {
+                if (input.xml) {
+                    textToCopy = input.xml
+                } else if (
+                    input.operations &&
+                    Array.isArray(input.operations)
+                ) {
+                    textToCopy = JSON.stringify(input.operations, null, 2)
+                } else if (Object.keys(input).length > 0) {
+                    textToCopy = JSON.stringify(input, null, 2)
+                }
+            }
+
+            if (
+                output &&
+                toolName === "get_shape_library" &&
+                typeof output === "string"
+            ) {
+                textToCopy = output
+            }
+
+            if (textToCopy) {
+                copyMessageToClipboard(callId, textToCopy, true)
             }
         }
 
@@ -687,9 +753,32 @@ export function ChatMessageDisplay({
                             <div className="h-4 w-4 border-2 border-primary border-t-transparent rounded-full animate-spin" />
                         )}
                         {state === "output-available" && (
-                            <span className="text-xs font-medium text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
-                                Complete
-                            </span>
+                            <>
+                                <span className="text-xs font-medium text-green-600 bg-green-50 px-2 py-0.5 rounded-full">
+                                    {dict.tools.complete}
+                                </span>
+                                {isExpanded && (
+                                    <button
+                                        type="button"
+                                        onClick={handleCopy}
+                                        className="p-1 rounded hover:bg-muted transition-colors"
+                                        title={
+                                            copiedToolCallId === callId
+                                                ? dict.chat.copied
+                                                : copyFailedToolCallId ===
+                                                    callId
+                                                  ? dict.chat.failedToCopy
+                                                  : dict.chat.copyResponse
+                                        }
+                                    >
+                                        {isCopied ? (
+                                            <Check className="w-4 h-4 text-green-600" />
+                                        ) : (
+                                            <Copy className="w-4 h-4 text-muted-foreground" />
+                                        )}
+                                    </button>
+                                )}
+                            </>
                         )}
                         {state === "output-error" &&
                             (() => {
@@ -782,9 +871,9 @@ export function ChatMessageDisplay({
 
     return (
         <ScrollArea className="h-full w-full scrollbar-thin">
-            {messages.length === 0 ? (
+            {messages.length === 0 && isRestored ? (
                 <ExamplePanel setInput={setInput} setFiles={setFiles} />
-            ) : (
+            ) : messages.length === 0 ? null : (
                 <div className="py-4 px-4 space-y-4">
                     {messages.map((message, messageIndex) => {
                         const userMessageText =
@@ -804,13 +893,23 @@ export function ChatMessageDisplay({
                                     .slice(messageIndex + 1)
                                     .every((m) => m.role !== "user"))
                         const isEditing = editingMessageId === message.id
+                        // Skip animation for restored messages
+                        // If isRestored but ref not set yet, we're in first render after restoration - treat all as restored
+                        const isRestoredMessage =
+                            isRestored &&
+                            (restoredMessageIdsRef.current === null ||
+                                restoredMessageIdsRef.current.has(message.id))
                         return (
                             <div
                                 key={message.id}
-                                className={`flex w-full ${message.role === "user" ? "justify-end" : "justify-start"} animate-message-in`}
-                                style={{
-                                    animationDelay: `${messageIndex * 50}ms`,
-                                }}
+                                className={`flex w-full ${message.role === "user" ? "justify-end" : "justify-start"} ${isRestoredMessage ? "" : "animate-message-in"}`}
+                                style={
+                                    isRestoredMessage
+                                        ? undefined
+                                        : {
+                                              animationDelay: `${messageIndex * 50}ms`,
+                                          }
+                                }
                             >
                                 {message.role === "user" &&
                                     userMessageText &&
@@ -832,7 +931,10 @@ export function ChatMessageDisplay({
                                                             )
                                                         }}
                                                         className="p-1.5 rounded-lg text-muted-foreground/60 hover:text-muted-foreground hover:bg-muted transition-colors"
-                                                        title="Edit message"
+                                                        title={
+                                                            dict.chat
+                                                                .editMessage
+                                                        }
                                                     >
                                                         <Pencil className="h-3.5 w-3.5" />
                                                     </button>
@@ -849,11 +951,13 @@ export function ChatMessageDisplay({
                                                 title={
                                                     copiedMessageId ===
                                                     message.id
-                                                        ? "Copied!"
+                                                        ? dict.chat.copied
                                                         : copyFailedMessageId ===
                                                             message.id
-                                                          ? "Failed to copy"
-                                                          : "Copy message"
+                                                          ? dict.chat
+                                                                .failedToCopy
+                                                          : dict.chat
+                                                                .copyResponse
                                                 }
                                             >
                                                 {copiedMessageId ===
@@ -901,6 +1005,9 @@ export function ChatMessageDisplay({
                                                             className="w-full"
                                                             isStreaming={
                                                                 isStreamingReasoning
+                                                            }
+                                                            defaultOpen={
+                                                                !isRestoredMessage
                                                             }
                                                         >
                                                             <ReasoningTrigger />
@@ -968,7 +1075,7 @@ export function ChatMessageDisplay({
                                                     }}
                                                     className="px-3 py-1.5 text-xs rounded-lg bg-muted hover:bg-muted/80 transition-colors"
                                                 >
-                                                    Cancel
+                                                    {dict.common.cancel}
                                                 </button>
                                                 <button
                                                     type="button"
@@ -990,7 +1097,7 @@ export function ChatMessageDisplay({
                                                     disabled={!editText.trim()}
                                                     className="px-3 py-1.5 text-xs rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
                                                 >
-                                                    Save & Submit
+                                                    {dict.chat.saveAndSubmit}
                                                 </button>
                                             </div>
                                         </div>
@@ -1123,7 +1230,8 @@ export function ChatMessageDisplay({
                                                                     "user" &&
                                                                 isLastUserMessage &&
                                                                 onEditMessage
-                                                                    ? "Click to edit"
+                                                                    ? dict.chat
+                                                                          .clickToEdit
                                                                     : undefined
                                                             }
                                                         >
@@ -1325,8 +1433,8 @@ export function ChatMessageDisplay({
                                                 title={
                                                     copiedMessageId ===
                                                     message.id
-                                                        ? "Copied!"
-                                                        : "Copy response"
+                                                        ? dict.chat.copied
+                                                        : dict.chat.copyResponse
                                                 }
                                             >
                                                 {copiedMessageId ===
@@ -1352,7 +1460,9 @@ export function ChatMessageDisplay({
                                                             )
                                                         }
                                                         className="p-1.5 rounded-lg text-muted-foreground/60 hover:text-foreground hover:bg-muted transition-colors"
-                                                        title="Regenerate response"
+                                                        title={
+                                                            dict.chat.regenerate
+                                                        }
                                                     >
                                                         <RotateCcw className="h-3.5 w-3.5" />
                                                     </button>
@@ -1374,7 +1484,7 @@ export function ChatMessageDisplay({
                                                         ? "text-green-600 bg-green-100"
                                                         : "text-muted-foreground/60 hover:text-green-600 hover:bg-green-50"
                                                 }`}
-                                                title="Good response"
+                                                title={dict.chat.goodResponse}
                                             >
                                                 <ThumbsUp className="h-3.5 w-3.5" />
                                             </button>
@@ -1393,7 +1503,7 @@ export function ChatMessageDisplay({
                                                         ? "text-red-600 bg-red-100"
                                                         : "text-muted-foreground/60 hover:text-red-600 hover:bg-red-50"
                                                 }`}
-                                                title="Bad response"
+                                                title={dict.chat.badResponse}
                                             >
                                                 <ThumbsDown className="h-3.5 w-3.5" />
                                             </button>

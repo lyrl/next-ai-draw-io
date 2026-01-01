@@ -3,16 +3,20 @@
 import { useChat } from "@ai-sdk/react"
 import { DefaultChatTransport } from "ai"
 import {
-    AlertTriangle,
     MessageSquarePlus,
     PanelRightClose,
     PanelRightOpen,
     Settings,
 } from "lucide-react"
 import Image from "next/image"
-import Link from "next/link"
 import type React from "react"
-import { useCallback, useEffect, useRef, useState } from "react"
+import {
+    useCallback,
+    useEffect,
+    useLayoutEffect,
+    useRef,
+    useState,
+} from "react"
 import { flushSync } from "react-dom"
 import { Toaster, toast } from "sonner"
 import { ButtonWithTooltip } from "@/components/button-with-tooltip"
@@ -26,10 +30,11 @@ import { useDictionary } from "@/hooks/use-dictionary"
 import { getSelectedAIConfig, useModelConfig } from "@/hooks/use-model-config"
 import { getApiEndpoint } from "@/lib/base-path"
 import { findCachedResponse } from "@/lib/cached-responses"
+import { formatMessage } from "@/lib/i18n/utils"
 import { isPdfFile, isTextFile } from "@/lib/pdf-utils"
 import { type FileData, useFileProcessor } from "@/lib/use-file-processor"
 import { useQuotaManager } from "@/lib/use-quota-manager"
-import { formatXML } from "@/lib/utils"
+import { cn, formatXML } from "@/lib/utils"
 import { ChatMessageDisplay } from "./chat-message-display"
 import { DevXmlSimulator } from "./dev-xml-simulator"
 
@@ -202,6 +207,18 @@ export default function ChatPanel({
 
     // Flag to track if we've restored from localStorage
     const hasRestoredRef = useRef(false)
+    const [isRestored, setIsRestored] = useState(false)
+
+    // Track previous isVisible to only animate when toggling (not on page load)
+    const prevIsVisibleRef = useRef(isVisible)
+    const [shouldAnimatePanel, setShouldAnimatePanel] = useState(false)
+    useEffect(() => {
+        // Only animate when visibility changes from false to true (not on initial load)
+        if (!prevIsVisibleRef.current && isVisible) {
+            setShouldAnimatePanel(true)
+        }
+        prevIsVisibleRef.current = isVisible
+    }, [isVisible])
 
     // Ref to track latest chartXML for use in callbacks (avoids stale closure)
     const chartXMLRef = useRef(chartXML)
@@ -336,7 +353,10 @@ export default function ChatPanel({
                 }
 
                 // Translate image not supported error
-                if (friendlyMessage.includes("image content block")) {
+                if (
+                    friendlyMessage.includes("image content block") ||
+                    friendlyMessage.toLowerCase().includes("image_url")
+                ) {
                     friendlyMessage = "This model doesn't support image input."
                 }
 
@@ -389,7 +409,9 @@ export default function ChatPanel({
                         MAX_CONTINUATION_RETRY_COUNT
                     ) {
                         toast.error(
-                            `Continuation retry limit reached (${MAX_CONTINUATION_RETRY_COUNT}). The diagram may be too complex.`,
+                            formatMessage(dict.errors.continuationRetryLimit, {
+                                max: MAX_CONTINUATION_RETRY_COUNT,
+                            }),
                         )
                         continuationRetryCountRef.current = 0
                         partialXmlRef.current = ""
@@ -400,7 +422,9 @@ export default function ChatPanel({
                     // Regular error: check retry count limit
                     if (autoRetryCountRef.current >= MAX_AUTO_RETRY_COUNT) {
                         toast.error(
-                            `Auto-retry limit reached (${MAX_AUTO_RETRY_COUNT}). Please try again manually.`,
+                            formatMessage(dict.errors.retryLimit, {
+                                max: MAX_AUTO_RETRY_COUNT,
+                            }),
                         )
                         autoRetryCountRef.current = 0
                         partialXmlRef.current = ""
@@ -423,7 +447,8 @@ export default function ChatPanel({
     const messagesEndRef = useRef<HTMLDivElement>(null)
 
     // Restore messages and XML snapshots from localStorage on mount
-    useEffect(() => {
+    // useLayoutEffect runs synchronously before browser paint, so messages appear immediately
+    useLayoutEffect(() => {
         if (hasRestoredRef.current) return
         hasRestoredRef.current = true
 
@@ -450,9 +475,11 @@ export default function ChatPanel({
             // On complete failure, clear storage to allow recovery
             localStorage.removeItem(STORAGE_MESSAGES_KEY)
             localStorage.removeItem(STORAGE_XML_SNAPSHOTS_KEY)
-            toast.error("Session data was corrupted. Starting fresh.")
+            toast.error(dict.errors.sessionCorrupted)
+        } finally {
+            setIsRestored(true)
         }
-    }, [setMessages])
+    }, [setMessages, dict.errors.sessionCorrupted])
 
     // Save messages to localStorage whenever they change (debounced to prevent blocking during streaming)
     useEffect(() => {
@@ -651,12 +678,10 @@ export default function ChatPanel({
             localStorage.removeItem(STORAGE_DIAGRAM_XML_KEY)
             localStorage.setItem(STORAGE_SESSION_ID_KEY, newSessionId)
             sessionStorage.removeItem(SESSION_STORAGE_INPUT_KEY)
-            toast.success("Started a fresh chat")
+            toast.success(dict.dialogs.clearSuccess)
         } catch (error) {
             console.error("Failed to clear localStorage:", error)
-            toast.warning(
-                "Chat cleared but browser storage could not be updated",
-            )
+            toast.warning(dict.errors.storageUpdateFailed)
         }
 
         setShowNewChatDialog(false)
@@ -889,7 +914,7 @@ export default function ChatPanel({
         return (
             <div className="h-full flex flex-col items-center pt-4 bg-card border border-border/30 rounded-xl">
                 <ButtonWithTooltip
-                    tooltipContent="Show chat panel (Ctrl+B)"
+                    tooltipContent={dict.nav.showPanel}
                     variant="ghost"
                     size="icon"
                     onClick={onToggleVisibility}
@@ -901,10 +926,9 @@ export default function ChatPanel({
                     className="text-sm font-medium text-muted-foreground mt-8 tracking-wide"
                     style={{
                         writingMode: "vertical-rl",
-                        transform: "rotate(180deg)",
                     }}
                 >
-                    AI Chat
+                    {dict.nav.aiChat}
                 </div>
             </div>
         )
@@ -912,12 +936,16 @@ export default function ChatPanel({
 
     // Full view
     return (
-        <div className="h-full flex flex-col bg-card shadow-soft animate-slide-in-right rounded-xl border border-border/30 relative">
+        <div
+            className={cn(
+                "h-full flex flex-col bg-card shadow-soft rounded-xl border border-border/30 relative",
+                shouldAnimatePanel && "animate-slide-in-right",
+            )}
+        >
             <Toaster
-                position="bottom-center"
+                position="bottom-left"
                 richColors
                 expand
-                style={{ position: "absolute" }}
                 toastOptions={{
                     style: {
                         maxWidth: "480px",
@@ -949,32 +977,6 @@ export default function ChatPanel({
                                 Next AI Drawio
                             </h1>
                         </div>
-                        {!isMobile && (
-                            <Link
-                                href="/about"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                                className="text-sm text-muted-foreground hover:text-foreground transition-colors ml-2"
-                            >
-                                About
-                            </Link>
-                        )}
-                        {!isMobile && (
-                            <Link
-                                href="/about"
-                                target="_blank"
-                                rel="noopener noreferrer"
-                            >
-                                <ButtonWithTooltip
-                                    tooltipContent="Sponsored by ByteDance Doubao K2-thinking. See About page for details."
-                                    variant="ghost"
-                                    size="icon"
-                                    className="h-6 w-6 text-amber-500 hover:text-amber-600"
-                                >
-                                    <AlertTriangle className="h-4 w-4" />
-                                </ButtonWithTooltip>
-                            </Link>
-                        )}
                     </div>
                     <div className="flex items-center gap-1 justify-end overflow-visible">
                         <ButtonWithTooltip
@@ -1029,6 +1031,7 @@ export default function ChatPanel({
                     onRegenerate={handleRegenerate}
                     status={status}
                     onEditMessage={handleEditMessage}
+                    isRestored={isRestored}
                 />
             </main>
 

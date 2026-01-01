@@ -12,7 +12,11 @@ import fs from "fs/promises"
 import { jsonrepair } from "jsonrepair"
 import path from "path"
 import { z } from "zod"
-import { getAIModel, supportsPromptCaching } from "@/lib/ai-providers"
+import {
+    getAIModel,
+    supportsImageInput,
+    supportsPromptCaching,
+} from "@/lib/ai-providers"
 import { findCachedResponse } from "@/lib/cached-responses"
 import {
     checkAndIncrementRequest,
@@ -244,9 +248,22 @@ async function handleChatRequest(req: Request): Promise<Response> {
     // === CACHE CHECK END ===
 
     // Read client AI provider overrides from headers
+    const provider = req.headers.get("x-ai-provider")
+    let baseUrl = req.headers.get("x-ai-base-url")
+
+    // For EdgeOne provider, construct full URL from request origin
+    // because createOpenAI needs absolute URL, not relative path
+    if (provider === "edgeone" && !baseUrl) {
+        const origin = req.headers.get("origin") || new URL(req.url).origin
+        baseUrl = `${origin}/api/edgeai`
+    }
+
+    // Get cookie header for EdgeOne authentication (eo_token, eo_time)
+    const cookieHeader = req.headers.get("cookie")
+
     const clientOverrides = {
-        provider: req.headers.get("x-ai-provider"),
-        baseUrl: req.headers.get("x-ai-base-url"),
+        provider,
+        baseUrl,
         apiKey: req.headers.get("x-ai-api-key"),
         modelId: req.headers.get("x-ai-model"),
         // AWS Bedrock credentials
@@ -254,6 +271,11 @@ async function handleChatRequest(req: Request): Promise<Response> {
         awsSecretAccessKey: req.headers.get("x-aws-secret-access-key"),
         awsRegion: req.headers.get("x-aws-region"),
         awsSessionToken: req.headers.get("x-aws-session-token"),
+        // Pass cookies for EdgeOne Pages authentication
+        ...(provider === "edgeone" &&
+            cookieHeader && {
+                headers: { cookie: cookieHeader },
+            }),
     }
 
     // Read minimal style preference from header
@@ -276,6 +298,17 @@ async function handleChatRequest(req: Request): Promise<Response> {
     const fileParts =
         lastUserMessage?.parts?.filter((part: any) => part.type === "file") ||
         []
+
+    // Check if user is sending images to a model that doesn't support them
+    // AI SDK silently drops unsupported parts, so we need to catch this early
+    if (fileParts.length > 0 && !supportsImageInput(modelId)) {
+        return Response.json(
+            {
+                error: `The model "${modelId}" does not support image input. Please use a vision-capable model (e.g., GPT-4o, Claude, Gemini) or remove the image.`,
+            },
+            { status: 400 },
+        )
+    }
 
     // User input only - XML is now in a separate cached system message
     const formattedUserInput = `User input:
@@ -605,7 +638,7 @@ Notes:
 Operations:
 - update: Replace an existing cell by its id. Provide cell_id and complete new_xml.
 - add: Add a new cell. Provide cell_id (new unique id) and new_xml.
-- delete: Remove a cell by its id. Only cell_id is needed.
+- delete: Remove a cell. Cascade is automatic: children AND edges (source/target) are auto-deleted. Only specify ONE cell_id.
 
 For update/add, new_xml must be a complete mxCell element including mxGeometry.
 
@@ -614,8 +647,8 @@ For update/add, new_xml must be a complete mxCell element including mxGeometry.
 Example - Add a rectangle:
 {"operations": [{"operation": "add", "cell_id": "rect-1", "new_xml": "<mxCell id=\\"rect-1\\" value=\\"Hello\\" style=\\"rounded=0;\\" vertex=\\"1\\" parent=\\"1\\"><mxGeometry x=\\"100\\" y=\\"100\\" width=\\"120\\" height=\\"60\\" as=\\"geometry\\"/></mxCell>"}]}
 
-Example - Delete a cell:
-{"operations": [{"operation": "delete", "cell_id": "rect-1"}]}`,
+Example - Delete container (children & edges auto-deleted):
+{"operations": [{"operation": "delete", "cell_id": "2"}]}`,
                 inputSchema: z.object({
                     operations: z
                         .array(

@@ -21,6 +21,7 @@ export type ProviderName =
     | "siliconflow"
     | "sglang"
     | "gateway"
+    | "edgeone"
     | "doubao"
 
 interface ModelConfig {
@@ -40,6 +41,8 @@ export interface ClientOverrides {
     awsSecretAccessKey?: string | null
     awsRegion?: string | null
     awsSessionToken?: string | null
+    // Custom headers (e.g., for EdgeOne cookie auth)
+    headers?: Record<string, string>
 }
 
 // Providers that can be used with client-provided API keys
@@ -54,6 +57,7 @@ const ALLOWED_CLIENT_PROVIDERS: ProviderName[] = [
     "siliconflow",
     "sglang",
     "gateway",
+    "edgeone",
     "doubao",
 ]
 
@@ -375,6 +379,7 @@ const PROVIDER_ENV_VARS: Record<ProviderName, string | null> = {
     siliconflow: "SILICONFLOW_API_KEY",
     sglang: "SGLANG_API_KEY",
     gateway: "AI_GATEWAY_API_KEY",
+    edgeone: null, // No credentials needed - uses EdgeOne Edge AI
     doubao: "DOUBAO_API_KEY",
 }
 
@@ -463,7 +468,12 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
     // SECURITY: Prevent SSRF attacks (GHSA-9qf7-mprq-9qgm)
     // If a custom baseUrl is provided, an API key MUST also be provided.
     // This prevents attackers from redirecting server API keys to malicious endpoints.
-    if (overrides?.baseUrl && !overrides?.apiKey) {
+    // Exception: EdgeOne provider doesn't require API key (uses Edge AI runtime)
+    if (
+        overrides?.baseUrl &&
+        !overrides?.apiKey &&
+        overrides?.provider !== "edgeone"
+    ) {
         throw new Error(
             `API key is required when using a custom base URL. ` +
                 `Please provide your own API key in Settings.`,
@@ -776,7 +786,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
                                                 `data: ${JSON.stringify(data)}\n\n`,
                                             ),
                                         )
-                                    } catch (e) {
+                                    } catch (_e) {
                                         // If parsing fails, forward the original message to avoid breaking the stream.
                                         controller.enqueue(
                                             new TextEncoder().encode(
@@ -840,6 +850,21 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
             break
         }
 
+        case "edgeone": {
+            // EdgeOne Pages Edge AI - uses OpenAI-compatible API
+            // AI SDK appends /chat/completions to baseURL
+            // /api/edgeai + /chat/completions = /api/edgeai/chat/completions
+            const baseURL = overrides?.baseUrl || "/api/edgeai"
+            const edgeoneProvider = createOpenAI({
+                apiKey: "edgeone", // Dummy key - EdgeOne doesn't require API key
+                baseURL,
+                // Pass cookies for EdgeOne Pages authentication (eo_token, eo_time)
+                ...(overrides?.headers && { headers: overrides.headers }),
+            })
+            model = edgeoneProvider.chat(modelId)
+            break
+        }
+
         case "doubao": {
             const apiKey = overrides?.apiKey || process.env.DOUBAO_API_KEY
             const baseURL =
@@ -856,7 +881,7 @@ export function getAIModel(overrides?: ClientOverrides): ModelConfig {
 
         default:
             throw new Error(
-                `Unknown AI provider: ${provider}. Supported providers: bedrock, openai, anthropic, google, azure, ollama, openrouter, deepseek, siliconflow, sglang, gateway, doubao`,
+                `Unknown AI provider: ${provider}. Supported providers: bedrock, openai, anthropic, google, azure, ollama, openrouter, deepseek, siliconflow, sglang, gateway, edgeone, doubao`,
             )
     }
 
@@ -880,4 +905,35 @@ export function supportsPromptCaching(modelId: string): boolean {
         modelId.startsWith("us.anthropic") ||
         modelId.startsWith("eu.anthropic")
     )
+}
+
+/**
+ * Check if a model supports image/vision input.
+ * Some models silently drop image parts without error (AI SDK warning only).
+ */
+export function supportsImageInput(modelId: string): boolean {
+    const lowerModelId = modelId.toLowerCase()
+
+    // Helper to check if model has vision capability indicator
+    const hasVisionIndicator =
+        lowerModelId.includes("vision") || lowerModelId.includes("vl")
+
+    // Models that DON'T support image/vision input (unless vision variant)
+    // Kimi K2 models don't support images
+    if (lowerModelId.includes("kimi") && !hasVisionIndicator) {
+        return false
+    }
+
+    // DeepSeek text models (not vision variants)
+    if (lowerModelId.includes("deepseek") && !hasVisionIndicator) {
+        return false
+    }
+
+    // Qwen text models (not vision variants like qwen-vl)
+    if (lowerModelId.includes("qwen") && !hasVisionIndicator) {
+        return false
+    }
+
+    // Default: assume model supports images
+    return true
 }
